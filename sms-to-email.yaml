@@ -1,0 +1,189 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to create Two way Email to SMS solution
+
+Parameters:
+  EmailDomain:
+    Type: String
+    Description: The email domain to use for the SMS-to-Email function
+
+Resources:
+  SMSToEmailTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SMSToEmailTopic
+
+  SMSToEmailLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SMSToEmailLambdaExecutionRole
+      Description: Role assumed by Lambda to convert SMS to Email
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InlineSMSToEmailLambdaExecutionRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/EmailToSMSMessageTracking
+
+  SMSToEmailLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Convert Incoming SMS to Email
+      FunctionName: SMSToEmailLambda
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt SMSToEmailLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 600
+      Environment:
+        Variables:
+          EMAIL_DOMAIN: !Ref EmailDomain
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          import json
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create AWS clients
+          ses = boto3.client('sesv2')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('EmailToSMSMessageTracking')
+          
+          def lambda_handler(event, context):
+              logger.info(event)
+              # Parse the incoming event
+              try:
+                  message = json.loads(event['Records'][0]['Sns']['Message'])
+                  phone_number = message['originationNumber']
+                  message_body = message['messageBody']
+                  previous_published_message_id = message.get('previousPublishedMessageId')
+              except (KeyError, json.JSONDecodeError) as e:
+                  logger.error(f"Error parsing event: {str(e)}")
+                  return
+
+              if not previous_published_message_id:
+                  logger.error("No previousPublishedMessageId found in the event")
+                  return
+
+              # Query DynamoDB for the destination email
+              try:
+                  response = table.get_item(Key={'message_id': previous_published_message_id})
+              except Exception as e:
+                  logger.error(f"Error querying DynamoDB: {str(e)}")
+                  return
+
+              item = response.get('Item')
+              if not item or 'source_email' not in item:
+                  logger.error(f"No source email found for messageId: {previous_published_message_id}")
+                  return
+
+              destination_email = item['source_email']
+              logger.info(f"Destination email: {destination_email}")
+
+              # Construct the email
+
+              # Replace the '+61' with '0' from the phone number (Australia) and use it as the email address
+
+              formatted_number = format_phone_number(phone_number)
+              from_email = f"{formatted_number}@{os.environ['EMAIL_DOMAIN']}"
+              subject = f"Re:{formatted_number}"
+              body = message_body
+
+              # Try to send the email
+              try:
+                  response = ses.send_email(
+                      FromEmailAddress=from_email,
+                      Destination={
+                          'ToAddresses': [destination_email],
+                      },
+                      Content={
+                          'Simple': {
+                              'Subject': {
+                                  'Data': subject
+                              },
+                              'Body': {
+                                  'Text': {
+                                      'Data': body
+                                  }
+                              }
+                          }
+                      }
+                  )
+                  logger.info(f"Email sent to {destination_email}! Message ID: {response['MessageId']}")
+        
+                  # Delete the DynamoDB record
+                  delete_dynamodb_record(previous_published_message_id)
+    
+              except Exception as e:
+                  logger.error(f"Error sending email: {str(e)}")
+
+          def delete_dynamodb_record(message_id):
+              try:
+                  response = table.delete_item(
+                      Key={
+                          'message_id': message_id
+                      }
+                  )
+                  logger.info(f"DynamoDB record deleted successfully for MessageId: {message_id}")
+              except Exception as e:
+                  logger.error(f"Error deleting DynamoDB record: {str(e)}")
+                  raise
+
+          def format_phone_number(phone_number):
+
+              # Replace the '+61' with '0' from the phone number (Australia)
+              formatted_number = f"0{phone_number[3:]}"
+
+              return formatted_number
+
+  SMSToEmailLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SMSToEmailLambdaFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SMSToEmailTopic
+
+  SMSToEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SMSToEmailTopic
+      Protocol: lambda
+      Endpoint: !GetAtt SMSToEmailLambdaFunction.Arn
+
+Outputs:
+  SMSToEmailTopicArn:
+    Description: ARN of the SNS topic for SMS to Email
+    Value: !Ref SMSToEmailTopic
+  SMSToEmailLambdaArn:
+    Description: ARN of the SMS to Email Lambda function
+    Value: !GetAtt SMSToEmailLambdaFunction.Arn

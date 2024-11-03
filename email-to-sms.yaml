@@ -1,0 +1,358 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to create Two-way Email to SMS solution
+
+Parameters:
+  RuleName:
+    Description: Name for SES Rule Set
+    Type: String
+    Default: EmailToSMSRule
+
+  Recipient1:
+    Description: Receipient condition in the SES Rule Set
+    Type: String
+
+  Recipient2:
+    Description: Receipient condition in the SES Rule Set
+    Type: String
+
+  PhoneNumberId:
+    Description: Phone number ID of the phone number to send SMS messages
+    Type: String
+
+Conditions:
+  Recipient2: !Not [!Equals [ !Ref Recipient2, ''] ]
+
+Resources:
+  MessageTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EmailToSMSMessageTracking
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiration_time
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+
+  EmailToSMSRuleSet:
+    Type: 'AWS::SES::ReceiptRuleSet'
+    Properties:
+      RuleSetName: !Ref RuleName
+
+  EmailToSMSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: EmailToSMSTopic
+      TopicName: EmailToSMSTopic
+  
+  SMSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EmailToSMSTopic
+      Protocol: lambda
+      Endpoint: !GetAtt EmailToSMSLambda.Arn
+
+  # Lambda function permission to allow SNS to invoke it
+  LambdaSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailToSMSLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref EmailToSMSTopic
+
+  SESRuleActivationLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SESRuleActivationLambdaExecutionRole
+      Description: Role assumed by SESRuleActivationLambda to manage SES rules
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InlineSESRuleActivationLambdaExecutionRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+                - Effect: Allow
+                  Action:
+                    - ses:SetActiveReceiptRuleSet
+                    - ses:DescribeActiveReceiptRuleSet
+                  Resource: "*"
+
+  SESRuleActivationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ses-rule-activation'
+      Handler: index.handler
+      Role: !GetAtt SESRuleActivationLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              ses = boto3.client('ses')
+              rule_set_name = event['ResourceProperties']['RuleSetName']
+
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      ses.set_active_receipt_rule_set(RuleSetName=rule_set_name)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Rule activated'})
+                  elif event['RequestType'] == 'Delete':
+                      ses.set_active_receipt_rule_set()  # Deactivate the rule set
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Rule deactivated'})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+
+  ActivateEmailToSMSRule:
+    DependsOn: 
+      - EmailToSMSRule
+    Type: 'Custom::ActivateEmailToSMSRule'
+    Properties:
+      ServiceToken: !GetAtt SESRuleActivationLambda.Arn
+      RuleSetName: !Ref EmailToSMSRuleSet
+      ServiceTimeout: 60
+
+  EmailToSMSRule:
+    DependsOn: 
+      - SESPermission
+    Type: 'AWS::SES::ReceiptRule'
+    Properties:
+      RuleSetName: !Ref EmailToSMSRuleSet
+      Rule:
+        Name: !Ref RuleName
+        Enabled: true
+        Recipients: 
+          - !Ref Recipient1
+          - !If
+            - Recipient2
+            - !Ref Recipient2
+            - !Ref AWS::NoValue
+        Actions:
+          - SNSAction:
+              Encoding: Base64
+              TopicArn: !Ref EmailToSMSTopic
+
+  EmailToSMSLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EmailToSMSLambdaExecutionRole
+      Description: Role assumed by Lambda to convert email to SMS
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InlineEmailToSMSLambdaExecutionRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - sms-voice:DescribePhoneNumbers
+                Resource: !Sub arn:aws:sms-voice:${AWS::Region}:${AWS::AccountId}:phone-number/${PhoneNumberId}
+              - Effect: Allow
+                Action:
+                  - sms-voice:SendTextMessage
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt MessageTrackingTable.Arn
+
+  EmailToSMSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Convert Email to SMS
+      FunctionName: EmailToSMSLambda
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt EmailToSMSLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 600
+      Environment:
+        Variables:
+          PHONE_NUMBER_ID: !Ref PhoneNumberId
+          DYNAMODB_TABLE_NAME: !Ref MessageTrackingTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import base64
+          import email
+          import os
+          from email import policy
+          import re
+          from datetime import datetime, timedelta
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize boto3 clients
+          sms = boto3.client('pinpoint-sms-voice-v2')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+
+          def lambda_handler(event, context):
+              logger.info(event)
+              try:
+                  # Extract the SNS message from the event
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  
+                  # Extract email body content
+                  email_content = extract_email_body(sns_message)
+                  logger.info(f"Email body content: {email_content}")
+                  
+                  # Extract and format the phone number
+                  destination_phone_number = format_phone_number(sns_message['mail']['destination'][0])
+                  logger.info(f"Destination phone number: {destination_phone_number}")
+                  
+                  # Get the origination phone number
+
+                  response = sms.describe_phone_numbers(
+                      PhoneNumberIds=[os.environ['PHONE_NUMBER_ID']]
+                  )
+
+                  origination_phone_number = response["PhoneNumbers"][0]["PhoneNumber"]
+                  logger.info(f"Origination phone number: {origination_phone_number}")
+                  # Publish SMS
+                  response = sms.send_text_message(
+                      DestinationPhoneNumber=destination_phone_number,
+                      OriginationIdentity=origination_phone_number,
+                      MessageBody=email_content,
+                      MessageType='TRANSACTIONAL'
+                  )
+                  
+                  logger.info(f"Message sent successfully. Message ID: {response['MessageId']}")
+
+                  # Get the current time in epoch second format
+                  current_time = int(datetime.now().timestamp())
+
+                  # Calculate the expiration time (7 days from now) in epoch second format
+                  expiration_time = int((datetime.now() + timedelta(days=7)).timestamp())
+
+                  # Store message ID and source email address in DynamoDB
+                  table.put_item(
+                      Item={
+                          'message_id': response['MessageId'],
+                          'source_email': sns_message['mail']['source'].split('=')[-1],
+                          'expiration_time': expiration_time
+                      }
+                  )
+                  logger.info(f"Stored message tracking info in DynamoDB")
+              
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+
+
+          def extract_email_body(sns_message):
+              # Get the base64 encoded content
+              content = sns_message['content']
+              
+              # Decode the base64 content
+              decoded_content = base64.b64decode(content)
+              
+              # Parse the email message
+              msg = email.message_from_bytes(decoded_content, policy=policy.default)
+              
+              # Extract the text content
+              if msg.is_multipart():
+                  for part in msg.walk():
+                      if part.get_content_type() == "text/plain":
+                          body = extract_latest_reply(part.get_payload(decode=True).decode())
+                          return truncate_message(body)
+              else:
+                  body = extract_latest_reply(msg.get_payload(decode=True).decode())
+                  return truncate_message(body)
+              return "Unable to extract email body"
+
+          def truncate_message(message, max_length=160):
+              """
+              Truncate the message to the specified maximum length.
+              If truncated, add an ellipsis (...) at the end.
+              """
+              if len(message) <= max_length:
+                  return message
+              return message[:max_length-3] + '...'
+
+          def extract_latest_reply(email_content):
+              # Split the content into lines
+              lines = email_content.split('\n')
+              
+              # Define a regex pattern to match "\ufeffOn [date], [time], xxx wrote:" more precisely
+              pattern = r'\ufeff?On .+, .+ wrote:'
+              
+              # Find the index of the line matching the pattern
+              cut_off_index = next((i for i, line in enumerate(lines) if re.match(pattern, line.strip())), len(lines))
+              
+              # Keep only the lines before the cut-off point and remove quoted lines
+              latest_reply_lines = []
+              for line in lines[:cut_off_index]:
+                  stripped_line = line.strip()
+                  if not stripped_line.startswith('>') and not stripped_line.startswith('&gt;'):
+                      latest_reply_lines.append(line)
+              
+              # Remove any trailing empty lines
+              while latest_reply_lines and not latest_reply_lines[-1].strip():
+                  latest_reply_lines.pop()
+              
+              # Join the remaining lines
+              latest_reply = '\n'.join(latest_reply_lines).strip()
+              
+              return latest_reply
+
+          def format_phone_number(email_address):
+              # Extract the local part of the email address (before @)
+              local_part = email_address.split('@')[0]
+              
+              # Remove the leading '0' and add '+61' for phone number (Australia)
+              if local_part.startswith('0'):
+                  formatted_number = '+61' + local_part[1:]
+              
+              return formatted_number
+
+
+  SESPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EmailToSMSLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/*
